@@ -1,6 +1,10 @@
 import io
+import os
+import copy
+import datetime
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 # ============================================================
 #  GIOVEN TRAVEL · Excel Toolkit
@@ -142,7 +146,7 @@ st.markdown(
     """
     <div class="hero">
         <h1>✈️ GIOVEN TRAVEL</h1>
-        <p>上传名单 · 选日期 · 一键生成整洁的 Excel 报表</p>
+        <p>上传总名单 · 选日期 · 一键生成 Rooming List (与模板完全一致)</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -155,6 +159,154 @@ def sec(n, title, sub):
         f'<div class="t">{title}<small>{sub}</small></div></div>',
         unsafe_allow_html=True,
     )
+
+
+# ============================================================
+#  LOGICA EXCEL
+# ============================================================
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template_rooming.xlsx")
+
+COLONNE_DATE = {
+    "rooming": ("首晚入住日期", "末晚入住日期"),   # 排房表   → 2ª e 3ª colonna
+    "passenger": ("上团日期", "下团日期"),          # 团员名单 → 1ª e 4ª colonna
+}
+COL_COGNOME = "姓"
+COLONNE_TPL = ["姓", "名", "性别", "出生日期", "国籍", "护照号", "到期时间", "房型", "备注"]
+COL_DATE_TPL = ("出生日期", "到期时间")
+RIGA_DATI = 5
+COL_A_K = range(1, 12)
+
+
+def _pulisci_testo(v):
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(v)
+    if s.strip().lower() in ("nan", "nat", "none"):
+        return ""
+    for ch in ["\xa0", " ", "　"]:
+        s = s.replace(ch, " ")
+    return s.strip()
+
+
+def _fmt_data(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return v.strftime("%d/%m/%Y")
+    s = _pulisci_testo(v)
+    if not s:
+        return ""
+    d = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    return d.strftime("%d/%m/%Y") if not pd.isna(d) else s
+
+
+def leggi_master(file_bytes):
+    """Legge il master escludendo le righe con celle SBARRATE (strikethrough)."""
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+    intestazioni = [c.value for c in ws[1]]
+    try:
+        idx_cognome = intestazioni.index(COL_COGNOME)
+    except ValueError:
+        idx_cognome = None
+
+    dati, n_barrate = [], 0
+    for riga in ws.iter_rows(min_row=2):
+        if idx_cognome is not None and riga[idx_cognome].value in (None, ""):
+            continue
+        barrata = any(
+            cell.value not in (None, "") and cell.font and cell.font.strike
+            for cell in riga
+        )
+        if barrata:
+            n_barrate += 1
+            continue
+        dati.append([c.value for c in riga])
+    return pd.DataFrame(dati, columns=intestazioni), n_barrate
+
+
+def filtra_periodo(df, col_ini, col_fine, data_inizio, data_fine):
+    ini = pd.to_datetime(df[col_ini], errors="coerce")
+    fin = pd.to_datetime(df[col_fine], errors="coerce")
+    mask = (ini <= pd.Timestamp(data_fine)) & (fin >= pd.Timestamp(data_inizio))
+    return df[mask].copy()
+
+
+def _snap(cell):
+    return (copy.copy(cell.font), copy.copy(cell.fill), copy.copy(cell.border),
+            copy.copy(cell.alignment), cell.number_format)
+
+
+def _applica(cell, stile):
+    f, fi, b, al, nf = stile
+    cell.font = copy.copy(f)
+    cell.fill = copy.copy(fi)
+    cell.border = copy.copy(b)
+    cell.alignment = copy.copy(al)
+    cell.number_format = nf
+
+
+def genera_da_template(tpl_bytes, df, hotel="", arriving_date=None):
+    wb = load_workbook(io.BytesIO(tpl_bytes))
+    ws = wb.active
+
+    proto_dati = {c: _snap(ws.cell(row=RIGA_DATI, column=c)) for c in COL_A_K}
+    proto_guida = {c: _snap(ws.cell(row=23, column=c)) for c in COL_A_K}
+    proto_vuota = {c: _snap(ws.cell(row=30, column=c)) for c in COL_A_K}
+
+    for rng in list(ws.merged_cells.ranges):
+        s = str(rng)
+        if s.startswith("I") and ":" in s:
+            ws.unmerge_cells(s)
+
+    for r in range(RIGA_DATI, 41):
+        for c in COL_A_K:
+            ws.cell(row=r, column=c).value = None
+
+    ws["A3"].value = hotel or ""
+    if arriving_date is not None:
+        ws["F3"].value = f"Arriving Date {pd.Timestamp(arriving_date).strftime('%d/%m/%Y')}"
+
+    n = len(df)
+    r = RIGA_DATI
+    for i, (_, riga) in enumerate(df.iterrows()):
+        for c in COL_A_K:
+            _applica(ws.cell(row=r, column=c), proto_dati[c])
+        ws.cell(row=r, column=1, value=i + 1)
+        for j, col in enumerate(COLONNE_TPL):
+            v = riga.get(col)
+            v = _fmt_data(v) if col in COL_DATE_TPL else _pulisci_testo(v)
+            ws.cell(row=r, column=2 + j, value=v)
+        ws.cell(row=r, column=11, value=None)
+        r += 1
+
+    for etichetta in ["GUIDA", "AUTISTA"]:
+        for c in COL_A_K:
+            _applica(ws.cell(row=r, column=c), proto_guida[c])
+        ws.cell(row=r, column=1, value=r - RIGA_DATI + 1)
+        ws.cell(row=r, column=2, value=etichetta)
+        ws.cell(row=r, column=9, value="SGL")
+        r += 1
+
+    while r <= 34:
+        for c in COL_A_K:
+            _applica(ws.cell(row=r, column=c), proto_vuota[c])
+        ws.cell(row=r, column=1, value=r - RIGA_DATI + 1)
+        r += 1
+
+    ws["M12"].value = n + 2  # Totale Pax = passeggeri + Guida + Autista
+    for cell in ("M5", "M6", "M7", "M8", "M9"):
+        ws[cell].value = None
+    ws["M11"].value = "=SUM(M5:M9)"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ------------------------------------------------------------
@@ -187,108 +339,109 @@ c2.button(
     args=("passenger",),
 )
 modalita = st.session_state.mode
+col_inizio, col_fine = COLONNE_DATE[modalita]
+base_label = "首晚 / 末晚入住日期" if modalita == "rooming" else "上团 / 下团日期"
 
 # ------------------------------------------------------------
 #  ② Upload
 # ------------------------------------------------------------
-sec("2", "上传文件", "Carica l'Excel (.xlsx)")
+sec("2", "上传总名单", "Carica il master 报名表 (.xlsx)")
 file_caricato = st.file_uploader("上传", type=["xlsx"], label_visibility="collapsed")
 
 
 if file_caricato is not None:
     try:
-        df_origine = pd.read_excel(file_caricato)
+        df_origine, n_barrate = leggi_master(file_caricato.getvalue())
+        if n_barrate > 0:
+            st.markdown(
+                f'<div class="stat"><div class="big">🚫 {n_barrate}</div>'
+                f'<div class="lbl">已自动忽略“划线删除(取消)”的乘客<br>'
+                f'<b>有效乘客 {len(df_origine)}</b></div></div>',
+                unsafe_allow_html=True,
+            )
 
-        if modalita == "rooming":
-            colonna_inizio, colonna_fine = "首晚入住日期", "末晚入住日期"
-            prefisso_file, base_label = "在店客户名单", "首晚 / 末晚入住日期"
-        else:
-            colonna_inizio, colonna_fine = "上团日期", "下团日期"
-            prefisso_file, base_label = "团队行程名单", "上团 / 下团日期"
-
-        if colonna_inizio in df_origine.columns and colonna_fine in df_origine.columns:
-            df_pulito = df_origine.copy()
-            ignora = ["nan", "nat", "none", "", "null", "undefined", "-", "/"]
-            for col in [colonna_inizio, colonna_fine]:
-                df_pulito[col] = df_pulito[col].astype(str).str.strip()
-                df_pulito = df_pulito[~df_pulito[col].str.lower().isin(ignora)]
-            df_pulito[colonna_inizio] = pd.to_datetime(df_pulito[colonna_inizio], errors="coerce").dt.date
-            df_pulito[colonna_fine] = pd.to_datetime(df_pulito[colonna_fine], errors="coerce").dt.date
-            df_pulito = df_pulito.dropna(subset=[colonna_inizio, colonna_fine])
-
-            if not df_pulito.empty:
-                sec("3", "选择日期范围", f"基于 {base_label}")
-                min_date = df_pulito[colonna_inizio].min()
-                max_date = df_pulito[colonna_fine].max()
-                intervallo = st.date_input(
-                    "日期范围",
-                    value=(min_date, max_date),
-                    min_value=min_date,
-                    max_value=max_date,
-                    label_visibility="collapsed",
-                )
-
-                if isinstance(intervallo, tuple) and len(intervallo) == 2:
-                    d1, d2 = intervallo
-                    df_filtrato = df_pulito[
-                        (df_pulito[colonna_inizio] <= d2) & (df_pulito[colonna_fine] >= d1)
-                    ].copy()
-                    st.markdown(
-                        f'<div class="stat"><div class="big">{len(df_filtrato)}</div>'
-                        f'<div class="lbl">条数据符合条件<br><b>{d1}</b> → <b>{d2}</b></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                    nome_file_output = f"{prefisso_file}_{d1}_al_{d2}.xlsx"
-                else:
-                    df_filtrato = pd.DataFrame(columns=df_pulito.columns)
-                    st.warning("请在日历中选择完整的结束日期。")
-                    nome_file_output = f"{prefisso_file}.xlsx"
-            else:
-                st.error("⚠️ 日期列全部为空、错位或含乱码，无法筛选！")
-                df_filtrato = pd.DataFrame()
-                nome_file_output = "名单.xlsx"
-        else:
+        if col_inizio not in df_origine.columns or col_fine not in df_origine.columns:
             st.error(
-                f"❌ 此模式需要 '{colonna_inizio}' 和 '{colonna_fine}' 两列，未找到。"
+                f"❌ 此模式需要 '{col_inizio}' 和 '{col_fine}' 两列，未找到。"
                 "请检查表头或切换上方模式。"
             )
-            df_filtrato = pd.DataFrame()
-            nome_file_output = "名单.xlsx"
+            st.stop()
 
-        # --- ④ Anteprima + download ---
-        if not df_filtrato.empty:
-            sec("4", "预览与下载", "Controlla e scarica")
-            st.dataframe(df_filtrato, use_container_width=True, hide_index=True)
+        serie_ini = pd.to_datetime(df_origine[col_inizio], errors="coerce")
+        serie_fine = pd.to_datetime(df_origine[col_fine], errors="coerce")
+        if not serie_ini.notna().any():
+            st.error("⚠️ 日期列全部为空、错位或含乱码，无法筛选！")
+            st.stop()
 
-            colonne = list(df_filtrato.columns)
-            with st.expander("⚙️ 更多选项：调整导出列的顺序"):
-                colonne_sel = st.multiselect(
-                    "选择并排序需要导出的列：", options=colonne, default=colonne
-                )
-            if not colonne_sel:
-                colonne_sel = colonne
+        min_date, max_date = serie_ini.min().date(), serie_fine.max().date()
 
-            df_ordinato = df_filtrato[colonne_sel].copy()
-            for c in (colonna_inizio, colonna_fine):
-                if c in df_ordinato.columns:
-                    df_ordinato[c] = df_ordinato[c].astype(str)
+        sec("3", "选择日期范围", f"基于 {base_label}")
+        intervallo = st.date_input(
+            "日期范围",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            label_visibility="collapsed",
+        )
+        if not (isinstance(intervallo, tuple) and len(intervallo) == 2):
+            st.warning("请在日历中选择完整的结束日期。")
+            st.stop()
+
+        d1, d2 = intervallo
+        df_filtrato = filtra_periodo(df_origine, col_inizio, col_fine, d1, d2)
+        st.markdown(
+            f'<div class="stat"><div class="big">{len(df_filtrato)}</div>'
+            f'<div class="lbl">位乘客符合条件<br><b>{d1}</b> → <b>{d2}</b></div></div>',
+            unsafe_allow_html=True,
+        )
+        if df_filtrato.empty:
+            st.info("当前没有符合条件的乘客。")
+            st.stop()
+
+        # --- ④ Info output + anteprima + download ---
+        sec("4", "预览与下载", "Controlla e scarica")
+        colonne_preview = [c for c in COLONNE_TPL if c in df_filtrato.columns]
+        st.dataframe(df_filtrato[colonne_preview], use_container_width=True, hide_index=True)
+
+        cha, chb = st.columns(2)
+        hotel = cha.text_input("🏨 酒店名称 (Hotel)", value="")
+        arriving = chb.date_input("📅 Arriving Date", value=d1)
+
+        if modalita == "rooming":
+            if not os.path.exists(TEMPLATE_PATH):
+                st.error("缺少模板文件 template_rooming.xlsx，请将其与 streamlit_app.py 放在同一目录。")
+                st.stop()
+            with open(TEMPLATE_PATH, "rb") as f:
+                tpl_bytes = f.read()
+            output_bytes = genera_da_template(tpl_bytes, df_filtrato, hotel=hotel, arriving_date=arriving)
+            nome_file = f"Rooming_List_{d1}_al_{d2}.xlsx"
+            label = "📥 下载 Rooming List (与模板完全一致)"
+        else:
+            # modalità passenger: esporta i dati filtrati e puliti (formato semplice)
+            df_exp = df_filtrato[colonne_preview].copy()
+            for c in COL_DATE_TPL:
+                if c in df_exp.columns:
+                    df_exp[c] = df_exp[c].map(_fmt_data)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                df_ordinato.to_excel(writer, index=False)
+                df_exp.to_excel(writer, index=False)
+            output_bytes = buffer.getvalue()
+            nome_file = f"团队行程名单_{d1}_al_{d2}.xlsx"
+            label = "📥 下载 团员名单"
 
-            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-            st.download_button(
-                label=f"📥 下载 {prefisso_file}",
-                data=buffer.getvalue(),
-                file_name=nome_file_output,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        st.download_button(
+            label=label,
+            data=output_bytes,
+            file_name=nome_file,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     except Exception as e:
         st.error(f"运行过程中发生错误：{e}")
 else:
     st.markdown(
         '<div style="text-align:center;color:#a5aec2;padding:22px 0 4px;font-size:.92rem;">'
-        "👆 上传一个 Excel 文件即可开始 · Carica un file per iniziare</div>",
+        "👆 上传总名单即可开始 · Carica il master per iniziare</div>",
         unsafe_allow_html=True,
     )
